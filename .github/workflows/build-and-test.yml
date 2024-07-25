@@ -1,93 +1,57 @@
-name: Build and test
+name: Build and test nativelink
 on:
   push:
-  pull_request:
+  workflow_dispatch:
+  workflow_call:
+  workflow_run:
+    workflows: ["rebase upstream manual", "rebase upstream cron"]
+    types:
+      - completed
 jobs:
-  linux-build-and-test:
-    runs-on: 4-core-ubuntu
-    steps:
-    - uses: actions/checkout@v4.1.0
-    - uses: ./.github/actions/setup_linux_env
-    - uses: ./.github/actions/build_debug
-    - uses: ./.github/actions/run_test_py
-  macos-build-and-test:
-    runs-on: macos-latest
-    steps:
-    - uses: maxim-lobanov/setup-xcode@v1.6.0
-      with:
-        xcode-version: 15.3.0
-    - uses: actions/checkout@v4.1.0
-    - uses: ./.github/actions/setup_macos_env
-    - uses: ./.github/actions/build_debug
-    - uses: ./.github/actions/run_test_py
-  windows-build-and-test:
-    runs-on: windows-latest
-    steps:
-    - uses: actions/checkout@v4.1.0
-    - uses: ./.github/actions/setup_windows_env
-    - uses: ./.github/actions/build_debug
-    - uses: ./.github/actions/run_test_py
-  macos-build-examples:
-    runs-on: macos-latest
-    steps:
-    - uses: maxim-lobanov/setup-xcode@v1.6.0
-      with:
-        xcode-version: 15.3.0
-    - uses: actions/checkout@v4.1.0
-    - uses: ./.github/actions/setup_macos_env
-    - uses: ./.github/actions/init_opam
-    - uses: ./.github/actions/build_release
-    - name: Setup the 'example/with_prelude' project
-      run: |-
-        cd examples/with_prelude
-        ./haskell-setup.sh
-        ./ocaml-setup.sh
-    - name: Build the 'example/with_prelude' project
-      run: |-
-        cd examples/with_prelude
-        $RUNNER_TEMP/artifacts/buck2 build //... -v 2
-        $RUNNER_TEMP/artifacts/buck2 test //... -v 2
-    - uses: ./.github/actions/build_example_no_prelude
-    - uses: ./.github/actions/setup_reindeer
-    - uses: ./.github/actions/build_bootstrap
   linux-build-examples:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4.1.0
     - uses: ./.github/actions/setup_linux_env
     - uses: ./.github/actions/init_opam
-    - uses: ./.github/actions/build_release
-    - name: Setup the 'example/with_prelude' project
-      run: |-
-        cd examples/with_prelude
-        ./haskell-setup.sh
-        ./ocaml-setup.sh
-    - name: Build the 'example/with_prelude' project
-      run: |-
-        cd examples/with_prelude
-        $RUNNER_TEMP/artifacts/buck2 build //... -v 2
-        $RUNNER_TEMP/artifacts/buck2 test //... -v 2
-    - uses: ./.github/actions/build_example_conan
+    - uses: ./.github/actions/build_debug
+    - uses: ./.github/actions/build_example_nativelink
+      with:
+        NATIVELINK_ENGINE_ADDRESS_SECRET: ${{ secrets.NATIVELINK_ENGINE_ADDRESS_SECRET }}
+        NATIVELINK_AC_ADDRESS_SECRET: ${{ secrets.NATIVELINK_AC_ADDRESS_SECRET }}
+        NATIVELINK_CAS_ADDRESS_SECRET: ${{ secrets.NATIVELINK_CAS_ADDRESS_SECRET }}
+        NATIVELINK_HEADER_RW_KEY_SECRET: ${{ secrets.NATIVELINK_HEADER_RW_KEY_SECRET }}
     - uses: ./.github/actions/build_example_no_prelude
+      with:
+        NATIVELINK_ENGINE_ADDRESS_SECRET: ${{ secrets.NATIVELINK_ENGINE_ADDRESS_SECRET }}
+        NATIVELINK_AC_ADDRESS_SECRET: ${{ secrets.NATIVELINK_AC_ADDRESS_SECRET }}
+        NATIVELINK_CAS_ADDRESS_SECRET: ${{ secrets.NATIVELINK_CAS_ADDRESS_SECRET }}
+        NATIVELINK_HEADER_RW_KEY_SECRET: ${{ secrets.NATIVELINK_HEADER_RW_KEY_SECRET }}
     - uses: ./.github/actions/setup_reindeer
-    - uses: ./.github/actions/build_bootstrap
-  windows-build-examples:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4.1.0
-      - uses: ./.github/actions/setup_windows_env
-      - uses: ./.github/actions/build_release
-      - name: Build example/prelude directory
-        run: |-
-          cd examples/with_prelude
-          & $Env:RUNNER_TEMP/artifacts/buck2 build //... -v 2
-          & $Env:RUNNER_TEMP/artifacts/buck2 test //... -v 2
-      - uses: ./.github/actions/build_example_no_prelude
-      - name: Configure CARGO_HOME
-        run: |-
-          echo CARGO_HOME=$GITHUB_WORKSPACE/.cargo >> $GITHUB_ENV
-          echo $GITHUB_WORKSPACE/.cargo/bin >> $GITHUB_PATH
-        shell:
-          bash
-      - uses: ./.github/actions/setup_reindeer
-      - uses: ./.github/actions/build_bootstrap
+    #- uses: ./.github/actions/build_bootstrap
+    - uses: DeterminateSystems/nix-installer-action@de22e16c4711fca50c816cc9081563429d1cf563
+      name: Install Nix
+    - uses: endersonmenezes/free-disk-space@3f9ec39ebae520864ac93467ee395f5237585c21
+      name: Free disk space
+      with:
+        remove_android: true
+        remove_dotnet: true
+        remove_haskell: true
+        remove_tool_cache: false
+    - uses: DeterminateSystems/magic-nix-cache-action@fc6aaceb40b9845a02b91e059ec147e78d1b4e41
+      name: Cache Nix derivations
+    # Required due to the mismatch of protoc and nix prebuild bins
+    # - name: Install Protoc
+    #   uses: arduino/setup-protoc@v3
+    #   with:
+    #     version: "21.4"
+    - uses: ./.github/actions/build_buck2_nativelink
+      with:
+        NATIVELINK_ENGINE_ADDRESS_SECRET: ${{ secrets.NATIVELINK_ENGINE_ADDRESS_SECRET }}
+        NATIVELINK_AC_ADDRESS_SECRET: ${{ secrets.NATIVELINK_AC_ADDRESS_SECRET }}
+        NATIVELINK_CAS_ADDRESS_SECRET: ${{ secrets.NATIVELINK_CAS_ADDRESS_SECRET }}
+        NATIVELINK_HEADER_RW_KEY_SECRET: ${{ secrets.NATIVELINK_HEADER_RW_KEY_SECRET }}
+    # - name: what-ran
+    #   run: |-
+    #     $RUNNER_TEMP/artifacts/buck2 log what-ran --format json | jq .
+    #   shell: bash

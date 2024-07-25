@@ -1,0 +1,53 @@
+name: build_buck2_nativelink
+inputs:
+  NATIVELINK_ENGINE_ADDRESS_SECRET:
+    description: ''
+    required: true
+  NATIVELINK_AC_ADDRESS_SECRET:
+    description: ''
+    required: true
+  NATIVELINK_CAS_ADDRESS_SECRET:
+    description: ''
+    required: true
+  NATIVELINK_HEADER_RW_KEY_SECRET:
+    description: ''
+    required: true
+runs:
+  using: composite
+  steps:
+  - name:
+    run: |-
+      DEBIAN_FRONTEND=noninteractive sudo apt-get install -y clang-format clang-tidy clang-tools clang clangd libc++-dev libc++1 libc++abi-dev libc++abi1 libclang-dev libclang1 liblldb-dev libllvm-ocaml-dev libomp-dev libomp5 lld lldb llvm-dev llvm-runtime llvm python3-clang protobuf-compiler libprotobuf-dev
+    shell: bash
+  - name: Build `buck2` with `buck2` using remote execution
+    run: |-
+      echo "[buck2_re_client]
+      engine_address       = $NATIVELINK_ENGINE_ADDRESS
+      action_cache_address = $NATIVELINK_AC_ADDRESS
+      cas_address          = $NATIVELINK_CAS_ADDRESS
+      http_headers         = x-nativelink-api-key:$NATIVELINK_HEADER_RW_KEY
+      tls = true
+      instance_name = main
+      enabled = true
+      capabilities = true
+      [build]
+      execution_platforms = prelude//platforms:default" > .buckconfig.local
+      cargo install --locked --git https://github.com/facebookincubator/reindeer reindeer
+      nix develop --impure --command $RUNNER_TEMP/artifacts/buck2 clean
+      nix develop --impure --command $RUNNER_TEMP/artifacts/buck2 killall
+      rm -f shim/third-party/rust/Cargo.lock shim/third-party/rust/BUCK
+      reindeer --third-party-dir shim/third-party/rust buckify
+      # nix develop --impure --command $RUNNER_TEMP/artifacts/buck2 debug paranoid enable
+      export BUCK2_RE_DOWNLOAD_CONCURRENCY=5
+      nix develop --impure --command $RUNNER_TEMP/artifacts/buck2 build //:buck2 -v 1 --show-simple-output --ui re --ui io --ui dice --ui debugevents --num-threads 5
+    env:
+      NATIVELINK_ENGINE_ADDRESS: ${{ inputs.NATIVELINK_ENGINE_ADDRESS_SECRET }}
+      NATIVELINK_AC_ADDRESS: ${{ inputs.NATIVELINK_AC_ADDRESS_SECRET }}
+      NATIVELINK_CAS_ADDRESS: ${{ inputs.NATIVELINK_CAS_ADDRESS_SECRET }}
+      NATIVELINK_HEADER_RW_KEY: ${{ inputs.NATIVELINK_HEADER_RW_KEY_SECRET }}
+    shell: bash
+  - name: Buck2 failure
+    if: failure()
+    run: |-
+      nix develop --impure --command $RUNNER_TEMP/artifacts/buck2 log what-failed -v 4
+    shell: bash
