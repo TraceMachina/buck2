@@ -2,10 +2,11 @@
 root = .
 
 [buck2_re_client]
-action_cache_address = grpc://localhost:50051
-engine_address = grpc://localhost:50051
-cas_address = grpc://localhost:50051
-tls = false
+engine_address       = NATIVELINK_ENGINE_ADDRESS
+action_cache_address = NATIVELINK_AC_ADDRESS
+cas_address          = NATIVELINK_CAS_ADDRESS
+http_headers         = x-nativelink-api-key:NATIVELINK_HEADER_RW_KEY
+tls = true
 instance_name = main
 
 [build]

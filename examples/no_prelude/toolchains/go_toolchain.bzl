@@ -7,24 +7,11 @@
 
 GoCompilerInfo = provider(
     doc = "Information about how to invoke the go compiler.",
-    fields = ["compiler_path", "GOROOT"],
+    fields = ["compiler_path", "GOROOT", "GOCACHE"],
 )
 
 def _go_toolchain_impl(ctx):
-    download = _download_toolchain(ctx)
-
-    compiler_dst = ctx.actions.declare_output("compiler.exe" if host_info().os.is_windows else "compiler")
-
-    cmd = cmd_args()
-    if host_info().os.is_windows:
-        compiler_src = cmd_args(download, format = "{}\\go\\bin\\go.exe", relative_to = (compiler_dst, 1))
-        cmd.add([ctx.attrs._symlink_bat, compiler_dst.as_output(), compiler_src])
-    else:
-        compiler_src = cmd_args(download, format = "{}/go/bin/go", relative_to = (compiler_dst, 1))
-        cmd.add(["ln", "-sf", compiler_src, compiler_dst.as_output()])
-
-    ctx.actions.run(cmd, category = "cp_compiler")
-    return [DefaultInfo(default_output = download), GoCompilerInfo(compiler_path = compiler_dst, GOROOT = "")]
+    return [DefaultInfo(), GoCompilerInfo(compiler_path = "go", GOROOT = "", GOCACHE="/tmp/gocache")]
 
 go_toolchain = rule(
     impl = _go_toolchain_impl,
