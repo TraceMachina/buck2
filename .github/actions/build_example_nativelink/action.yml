@@ -1,4 +1,4 @@
-name: build_example_no_prelude
+name: build_example_nativelink
 inputs:
   NATIVELINK_ENGINE_ADDRESS_SECRET:
     description: ''
@@ -15,7 +15,7 @@ inputs:
 runs:
   using: composite
   steps:
-  - name: Build example/no_prelude directory
+  - name: Build examples/remote_execution/nativelink directory
     run: |-
       echo "[buck2_re_client]
       engine_address       = $NATIVELINK_ENGINE_ADDRESS
@@ -27,8 +27,8 @@ runs:
       enabled = true
       capabilities = true
       [build]
-      execution_platforms = root//platforms:platforms" > examples/no_prelude/.buckconfig.local
-      cd examples/no_prelude
+      execution_platforms = root//platforms:platforms" > examples/remote_execution/nativelink/.buckconfig.local
+      cd examples/remote_execution/nativelink
       export BUCK2_RE_DOWNLOAD_CONCURRENCY=25
       $RUNNER_TEMP/artifacts/buck2 build //... -v 1 --show-simple-output --ui re --ui io --ui dice --ui debugevents --num-threads 10
     env:
