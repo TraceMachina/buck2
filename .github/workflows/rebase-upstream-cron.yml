@@ -1,0 +1,24 @@
+name: rebase upstream cron
+on:
+  schedule:
+    - cron:  '0 15 * * *'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Rebase
+      run: |
+        git config --local user.email "github-actions@users.noreply.github.com"
+        git config --local user.name "github-actions"
+        git remote add upstream http://github.com/facebook/buck2.git
+        git fetch upstream
+        git rebase upstream/main 
+    - name: Push changes
+      uses: ad-m/github-push-action@master
+      with:
+        force_with_lease: true
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        branch: ${{ github.ref }}
