@@ -1,4 +1,4 @@
-name: build_example_no_prelude
+name: build_example_nativelink
 inputs:
   NATIVELINK_ENGINE_ADDRESS_SECRET:
     description: ''
@@ -15,14 +15,14 @@ inputs:
 runs:
   using: composite
   steps:
-  - name: Build example/no_prelude directory
+  - name: Build examples/remote_execution/nativelink directory
     run: |-
       sed -i'' -e "s|NATIVELINK_ENGINE_ADDRESS|$NATIVELINK_ENGINE_ADDRESS|" \
                 -e "s|NATIVELINK_AC_ADDRESS|$NATIVELINK_AC_ADDRESS|" \
                 -e "s|NATIVELINK_CAS_ADDRESS|$NATIVELINK_CAS_ADDRESS|" \
                 -e "s|NATIVELINK_HEADER_RW_KEY|$NATIVELINK_HEADER_RW_KEY|" \
-                examples/no_prelude/.buckconfig
-      cd examples/no_prelude
+                examples/remote_execution/nativelink/.buckconfig
+      cd examples/remote_execution/nativelink
       $RUNNER_TEMP/artifacts/buck2 build //... -v 4
     env:
       NATIVELINK_ENGINE_ADDRESS: ${{ inputs.NATIVELINK_ENGINE_ADDRESS_SECRET }}
