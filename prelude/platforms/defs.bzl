@@ -19,10 +19,9 @@ def _execution_platform_impl(ctx: AnalysisContext) -> list[Provider]:
             local_enabled = True,
             remote_enabled = True,
             use_limited_hybrid = True,
-            # use_limited_hybrid = False,
-            allow_limited_hybrid_fallbacks = True,
-            allow_hybrid_fallbacks_on_failure = True,
-            experimental_low_pass_filter = True,
+            allow_limited_hybrid_fallbacks = False,
+            allow_hybrid_fallbacks_on_failure = False,
+            experimental_low_pass_filter = False,
             remote_cache_enabled = True,
             remote_execution_properties = {
                 "OSFamily": "linux",

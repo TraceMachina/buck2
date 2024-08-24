@@ -1,1 +1,13 @@
 buildscript = []
+
+[platform_fixup.'cfg(any(target_arch = "aarch64", target_arch = "loongarch64", target_arch = "mips64", target_arch = "powerpc64", target_arch = "wasm32", target_arch = "x86_64"))']
+buildscript = []
+rustc_flags = [
+    '--cfg=fast_arithmetic="64"'
+]
+
+[platform_fixup.'cfg(not(any(target_arch = "aarch64", target_arch = "loongarch64", target_arch = "mips64", target_arch = "powerpc64", target_arch = "wasm32", target_arch = "x86_64")))']
+buildscript = []
+rustc_flags = [
+    '--cfg=fast_arithmetic="32"'
+]

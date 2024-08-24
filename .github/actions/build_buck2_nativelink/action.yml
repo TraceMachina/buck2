@@ -35,6 +35,7 @@ runs:
       cargo install --locked --git https://github.com/facebookincubator/reindeer reindeer
       nix develop --impure --command $RUNNER_TEMP/artifacts/buck2 clean
       nix develop --impure --command $RUNNER_TEMP/artifacts/buck2 killall
+      rm -f shim/third-party/rust/Cargo.lock shim/third-party/rust/BUCK 
       reindeer --third-party-dir shim/third-party/rust buckify
       # nix develop --impure --command $RUNNER_TEMP/artifacts/buck2 debug paranoid enable
       nix develop --impure --command $RUNNER_TEMP/artifacts/buck2 build //:buck2 -v 4 --ui re
