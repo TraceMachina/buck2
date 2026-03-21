@@ -9,6 +9,7 @@
  */
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env::VarError;
 use std::io;
 use std::io::Cursor;
@@ -666,6 +667,7 @@ impl REClient {
         engine_address: String,
         action_cache_address: String,
     ) -> Self {
+        let cas_ttl_secs = runtime_opts.cas_ttl_secs;
         REClient {
             runtime_opts,
             pool,
@@ -673,7 +675,7 @@ impl REClient {
             instance_name,
             find_missing_cache: Mutex::new(FindMissingCache {
                 cache: LruCache::new(NonZeroUsize::new(500_000).unwrap()),
-                ttl: Duration::from_hours(12), // 12 hours TODO: Tune this parameter
+                ttl: Duration::from_secs(cas_ttl_secs.max(0) as u64),
                 last_check: Instant::now(),
             }),
             bystream_compressor,
@@ -706,8 +708,11 @@ impl REClient {
                 .await?;
 
             Ok(ActionResultResponse {
-                action_result: convert_action_result(res.into_inner())?,
-                ttl: 0,
+                action_result: convert_action_result(
+                    res.into_inner(),
+                    self.runtime_opts.cas_ttl_secs,
+                )?,
+                ttl: self.runtime_opts.cas_ttl_secs,
             })
         })
         .await
@@ -738,8 +743,11 @@ impl REClient {
                 .await?;
 
             Ok(WriteActionResultResponse {
-                actual_action_result: convert_action_result(res.into_inner())?,
-                ttl_seconds: 0,
+                actual_action_result: convert_action_result(
+                    res.into_inner(),
+                    self.runtime_opts.cas_ttl_secs,
+                )?,
+                ttl_seconds: self.runtime_opts.cas_ttl_secs,
             })
         })
         .await
@@ -758,6 +766,8 @@ impl REClient {
             .execution_policy
             .map(|ep| ep.priority)
             .unwrap_or_default();
+
+        let cas_ttl_secs = self.runtime_opts.cas_ttl_secs;
 
         let stream = retry(|| async {
             let stream = self
@@ -781,7 +791,7 @@ impl REClient {
         })
         .await?;
 
-        let stream = futures::stream::try_unfold(stream, move |mut stream| async {
+        let stream = futures::stream::try_unfold(stream, move |mut stream| async move {
             let msg = match stream.try_next().await.context("RE channel error")? {
                 Some(msg) => msg,
                 None => return Ok(None),
@@ -810,12 +820,12 @@ impl REClient {
                             .result
                             .with_context(|| "The action result is not defined.")?;
 
-                        let action_result = convert_action_result(action_result)?;
+                        let action_result = convert_action_result(action_result, cas_ttl_secs)?;
 
                         let execute_response = ExecuteResponse {
                             action_result,
                             action_result_digest: TDigest::default(),
-                            action_result_ttl: 0,
+                            action_result_ttl: cas_ttl_secs,
                             status: TStatus {
                                 code: TCode::OK,
                                 message: execute_response_grpc.message,
@@ -1029,18 +1039,28 @@ impl REClient {
                 })
                 .await?;
 
-                // Update the results and the cache
+                // Build the set of missing digests first, so we don't
+                // prematurely cache them as ExistsOnRemote.
+                let missing: HashSet<TDigest> = resp
+                    .missing_blob_digests
+                    .iter()
+                    .map(|d| tdigest_from(d.clone()))
+                    .collect();
+
                 let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
                 for digest in &digests_to_check {
-                    remote_results.insert(digest.clone(), DigestRemoteState::ExistsOnRemote);
-                    find_missing_cache.put(digest.clone(), DigestRemoteState::ExistsOnRemote);
-                }
-
-                for digest in &resp.missing_blob_digests.map(|d| tdigest_from(d.clone())) {
-                    // If it's present in the MissingBlobsResponse, it's expired on the remote and
-                    // needs to be refetched.
-                    remote_results.insert(digest.clone(), DigestRemoteState::Missing);
-                    find_missing_cache.put(digest.clone(), DigestRemoteState::Missing);
+                    if missing.contains(digest) {
+                        // Missing is a transient state: the blob may be uploaded
+                        // or produced by an RE action at any time.  Do NOT cache
+                        // it -- a stale "Missing" entry would prevent future
+                        // FindMissingBlobs RPCs, and a premature "ExistsOnRemote"
+                        // entry would cause concurrent actions to skip uploading
+                        // a blob that hasn't been uploaded yet.
+                        remote_results.insert(digest.clone(), DigestRemoteState::Missing);
+                    } else {
+                        remote_results.insert(digest.clone(), DigestRemoteState::ExistsOnRemote);
+                        find_missing_cache.put(digest.clone(), DigestRemoteState::ExistsOnRemote);
+                    }
                 }
                 digests_to_check.clear();
             }
@@ -1133,7 +1153,10 @@ impl REClient {
     }
 }
 
-fn convert_action_result(action_result: ActionResult) -> anyhow::Result<TActionResult2> {
+fn convert_action_result(
+    action_result: ActionResult,
+    cas_ttl_secs: i64,
+) -> anyhow::Result<TActionResult2> {
     let execution_metadata = action_result
         .execution_metadata
         .with_context(|| "The execution metadata are not defined.")?;
@@ -1150,7 +1173,7 @@ fn convert_action_result(action_result: ActionResult) -> anyhow::Result<TActionR
             name: output_file.path,
             existed: false,
             executable: output_file.is_executable,
-            ttl: 0,
+            ttl: cas_ttl_secs,
             _dot_dot_default: (),
         })
     })?;
