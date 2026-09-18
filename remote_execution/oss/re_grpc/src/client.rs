@@ -104,6 +104,11 @@ use crate::response::*;
 
 const DEFAULT_MAX_TOTAL_BATCH_SIZE: usize = 4 * 1000 * 1000;
 
+/// Upper bound on how long `FindMissingCache` may go without re-checking the
+/// server, whatever `cas_ttl_secs` says. This is the value the cache used
+/// unconditionally before it was tied to `cas_ttl_secs`.
+const FIND_MISSING_CACHE_MAX_TTL_S: i64 = 12 * 60 * 60;
+
 fn tdigest_to(tdigest: TDigest) -> Digest {
     Digest {
         hash: tdigest.hash,
@@ -675,7 +680,15 @@ impl REClient {
             instance_name,
             find_missing_cache: Mutex::new(FindMissingCache {
                 cache: LruCache::new(NonZeroUsize::new(500_000).unwrap()),
-                ttl: Duration::from_secs(cas_ttl_secs.max(0) as u64),
+                // Clamped, not just tied to cas_ttl_secs. Following it upwards
+                // is a regression wherever cas_ttl_secs exceeds the 12h this
+                // replaces: a deployment that sets it to its server's retention
+                // (a week is normal) would cache ExistsOnRemote for a week, and
+                // a blob evicted server-side inside that window leaves the
+                // client wrong for the rest of it. Only confirmed-present
+                // digests are cached now, which bounds the damage, but the
+                // cache should never outlive the shorter of the two bounds.
+                ttl: Duration::from_secs(cas_ttl_secs.clamp(0, FIND_MISSING_CACHE_MAX_TTL_S) as u64),
                 last_check: Instant::now(),
             }),
             bystream_compressor,
