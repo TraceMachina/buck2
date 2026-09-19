@@ -66,6 +66,7 @@ pub struct WriteEventLog {
     buf: Vec<u8>,
     log_size_counter_bytes: Option<Arc<AtomicU64>>,
     retained_event_logs: usize,
+    event_sink_command: Option<String>,
 }
 
 impl WriteEventLog {
@@ -79,6 +80,7 @@ impl WriteEventLog {
         start_time: SystemTime,
         log_size_counter_bytes: Option<Arc<AtomicU64>>,
         retained_event_logs: usize,
+        event_sink_command: Option<String>,
     ) -> Self {
         Self {
             state: LogWriterState::Unopened {
@@ -93,6 +95,7 @@ impl WriteEventLog {
             buf: Vec::new(),
             log_size_counter_bytes,
             retained_event_logs,
+            event_sink_command,
         }
     }
 
@@ -182,6 +185,7 @@ impl WriteEventLog {
             path,
             event.trace_id()?.clone(),
             self.log_size_counter_bytes.clone(),
+            self.event_sink_command.as_deref(),
         )
         .await?;
         let mut writers = vec![writer];
@@ -257,9 +261,29 @@ async fn start_persist_event_log_subprocess(
     path: EventLogPathBuf,
     trace_id: TraceId,
     bytes_written: Option<Arc<AtomicU64>>,
+    event_sink_command: Option<&str>,
 ) -> buck2_error::Result<NamedEventLogWriter> {
-    let current_exe = std::env::current_exe().buck_error_context("No current_exe")?;
-    let mut command = buck2_util::process::async_background_command(current_exe);
+    // `[buck2] event_sink_command` replaces the program and its leading
+    // arguments; everything below still applies, so a replacement receives the
+    // same stream on the same pipe and is handed the same local path. An empty
+    // or whitespace-only value is treated as unset by the config layer.
+    let sink_argv: Vec<&str> = event_sink_command
+        .map(|c| c.split_whitespace().collect())
+        .unwrap_or_default();
+
+    let mut command = match sink_argv.split_first() {
+        Some((program, args)) => {
+            let mut command = buck2_util::process::async_background_command(program);
+            command.args(args);
+            command
+        }
+        None => {
+            let current_exe = std::env::current_exe().buck_error_context("No current_exe")?;
+            let mut command = buck2_util::process::async_background_command(current_exe);
+            command.args(["debug", "persist-event-logs"]);
+            command
+        }
+    };
     // @oss-disable: #[cfg(unix)]
     #[cfg(all(tokio_unstable, unix))] // @oss-enable
     {
@@ -269,7 +293,6 @@ async fn start_persist_event_log_subprocess(
     let manifold_name = &format!("{}{}", trace_id, path.extension());
     // TODO T184566736: detach subprocess
     command
-        .args(["debug", "persist-event-logs"])
         .args(["--manifold-name", manifold_name])
         .args(["--local-path".as_ref(), path.path.as_os_str()])
         .args(["--trace-id", &trace_id.to_string()]);
@@ -588,6 +611,7 @@ mod tests {
                 log_size_counter_bytes: None,
                 start_time: SystemTime::UNIX_EPOCH,
                 retained_event_logs: 5,
+                event_sink_command: None,
             })
         }
     }

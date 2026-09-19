@@ -335,6 +335,10 @@ fn get_event_log_subscriber<T: StreamingCommand>(
             .daemon_startup_config()
             .map(|daemon_startup_config| daemon_startup_config.retained_event_logs)
             .unwrap_or(DEFAULT_RETAINED_EVENT_LOGS),
+        ctx.immediate_config
+            .daemon_startup_config()
+            .ok()
+            .and_then(|daemon_startup_config| daemon_startup_config.event_sink_command.clone()),
     );
     Box::new(log)
 }

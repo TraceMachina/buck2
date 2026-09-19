@@ -642,6 +642,21 @@ pub struct DaemonStartupConfig {
     pub log_download_method: LogDownloadMethod,
     pub health_check_config: HealthCheckConfig,
     pub retained_event_logs: usize,
+    /// Command to receive the event stream instead of `buck2 debug
+    /// persist-event-logs`, as `[buck2] event_sink_command`.
+    ///
+    /// Buck2 already pipes every invocation's encoded event stream to a child
+    /// process; only the identity of that child is fixed. Naming it here lets a
+    /// build-observability service receive the stream from every invocation
+    /// without a wrapper in front of `buck2`, which matters because anything
+    /// that runs `buck2` directly, an IDE or a script or habit, otherwise
+    /// produces no telemetry at all.
+    ///
+    /// Space-separated; the first token is the program. The same
+    /// `--manifold-name`, `--local-path` and `--trace-id` arguments are
+    /// appended, so the replacement stays responsible for writing the local
+    /// log file.
+    pub event_sink_command: Option<String>,
     pub macos_qos_class: Option<String>,
     pub daemon_idle_timeout_s: Option<u64>,
     /// Pagable DICE storage settings, or `None` when paging is disabled.
@@ -740,6 +755,13 @@ impl DaemonStartupConfig {
                 })
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_RETAINED_EVENT_LOGS),
+            event_sink_command: config
+                .get(BuckconfigKeyRef {
+                    section: "buck2",
+                    property: "event_sink_command",
+                })
+                .map(ToOwned::to_owned)
+                .filter(|s| !s.trim().is_empty()),
             macos_qos_class: {
                 let from_config = config
                     .get(BuckconfigKeyRef {
@@ -815,6 +837,7 @@ impl DaemonStartupConfig {
             },
             health_check_config: HealthCheckConfig::default(),
             retained_event_logs: DEFAULT_RETAINED_EVENT_LOGS,
+            event_sink_command: None,
             macos_qos_class: None,
             daemon_idle_timeout_s: None,
             hydration: None,
