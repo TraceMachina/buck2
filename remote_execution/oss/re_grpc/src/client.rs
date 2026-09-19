@@ -74,6 +74,8 @@ use re_grpc_proto::google::bytestream::ReadResponse;
 use re_grpc_proto::google::bytestream::WriteRequest;
 use re_grpc_proto::google::bytestream::WriteResponse;
 use re_grpc_proto::google::bytestream::byte_stream_client::ByteStreamClient;
+use re_grpc_proto::build::bazel::remote::execution::v2::WaitExecutionRequest;
+use re_grpc_proto::google::longrunning::Operation;
 use re_grpc_proto::google::longrunning::operation::Result as OpResult;
 use re_grpc_proto::google::rpc::Code;
 use re_grpc_proto::google::rpc::Status;
@@ -108,6 +110,19 @@ const DEFAULT_MAX_TOTAL_BATCH_SIZE: usize = 4 * 1000 * 1000;
 /// server, whatever `cas_ttl_secs` says. This is the value the cache used
 /// unconditionally before it was tied to `cas_ttl_secs`.
 const FIND_MISSING_CACHE_MAX_TTL_S: i64 = 12 * 60 * 60;
+
+/// How many times a single action may reattach to its operation after the
+/// Execute stream breaks.
+///
+/// The point of a bound is that reattaching is only worth doing while the
+/// action is still making progress somewhere. A server that drops the stream
+/// every time is not going to be fixed by a fourth attempt, and looping would
+/// turn a visible failure into a build that never ends, which is worse.
+const EXECUTE_STREAM_REATTACHES: u32 = 3;
+
+/// Wait before reattaching, so a connection that has just broken has a moment
+/// to be replaced rather than being dialled again mid-teardown.
+const EXECUTE_STREAM_REATTACH_DELAY: Duration = Duration::from_millis(500);
 
 fn tdigest_to(tdigest: TDigest) -> Digest {
     Digest {
@@ -807,11 +822,29 @@ impl REClient {
         })
         .await?;
 
-        let stream = futures::stream::try_unfold(stream, move |mut stream| async move {
-            let msg = match stream.try_next().await.context("RE channel error")? {
+        let state = ExecuteStreamState {
+            stream,
+            client: self.execution_client().await?,
+            metadata: metadata.clone(),
+            use_fbcode_metadata: self.runtime_opts.use_fbcode_metadata,
+            operation_name: None,
+            reattaches_left: EXECUTE_STREAM_REATTACHES,
+            completed: false,
+        };
+
+        let stream = futures::stream::try_unfold(state, move |mut state| async move {
+            let msg = match state.next_message().await? {
                 Some(msg) => msg,
                 None => return Ok(None),
             };
+            // Remember what to reattach to. The name is only on the wire once
+            // the server has accepted the action.
+            if !msg.name.is_empty() {
+                state.operation_name = Some(msg.name.clone());
+            }
+            if msg.done {
+                state.completed = true;
+            }
 
             let status = if msg.done {
                 match msg
@@ -878,7 +911,7 @@ impl REClient {
                 }
             };
 
-            anyhow::Ok(Some((status, stream)))
+            anyhow::Ok(Some((status, state)))
         });
 
         // We fill in the action digest a little later here. We do it this way so we don't have to
@@ -1289,6 +1322,84 @@ fn convert_t_action_result2(t_action_result: TActionResult2) -> anyhow::Result<A
     };
 
     Ok(action_result)
+}
+
+/// An Execute stream, plus what is needed to reattach to the operation behind
+/// it if the stream breaks.
+///
+/// REAPI separates the action from the stream reporting on it: `Execute`
+/// starts the work and returns a stream, and `WaitExecution` reattaches to
+/// work already running, by operation name. The action does not care that the
+/// client went away, so a broken stream should cost a reconnect, not the
+/// action.
+///
+/// The OSS client did not implement the second half, which made any transport
+/// hiccup fatal to a long action. That is not a hypothetical: an auth proxy in
+/// front of a CAS was observed cutting streams at about 120 seconds, capping
+/// every action at two minutes. Bazel absorbed the same cut silently by
+/// reattaching; buck2 failed the build.
+struct ExecuteStreamState {
+    stream: tonic::Streaming<Operation>,
+    client: ExecutionClient<GrpcService>,
+    metadata: RemoteExecutionMetadata,
+    use_fbcode_metadata: bool,
+    /// Learned from the first message the server sends. Until it arrives there
+    /// is no operation to reattach to, so an early break is still fatal.
+    operation_name: Option<String>,
+    reattaches_left: u32,
+    /// Set once the server has sent a `done` message. After that the stream
+    /// ending is the expected outcome and must not trigger a reattach.
+    completed: bool,
+}
+
+impl ExecuteStreamState {
+    /// The next message, reattaching across a broken stream where possible.
+    async fn next_message(&mut self) -> anyhow::Result<Option<Operation>> {
+        loop {
+            let err = match self.stream.try_next().await {
+                Ok(Some(msg)) => return Ok(Some(msg)),
+                // A clean end. If the action finished this is how it looks; if
+                // it did not, the caller sees a stream that stopped early,
+                // which is the behaviour this had before reattaching existed.
+                Ok(None) => return Ok(None),
+                Err(err) => err,
+            };
+
+            if self.completed {
+                return Ok(None);
+            }
+
+            let Some(name) = self.operation_name.clone() else {
+                return Err(anyhow::Error::new(err)
+                    .context("RE channel error before the operation was named"));
+            };
+
+            if self.reattaches_left == 0 {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "RE channel error, and operation {name} could not be reattached to after {EXECUTE_STREAM_REATTACHES} attempts"
+                )));
+            }
+            self.reattaches_left -= 1;
+
+            tracing::debug!(
+                operation = %name,
+                error = %err,
+                "Execute stream broke; reattaching with WaitExecution"
+            );
+            tokio::time::sleep(EXECUTE_STREAM_REATTACH_DELAY).await;
+
+            self.stream = self
+                .client
+                .wait_execution(with_re_metadata(
+                    WaitExecutionRequest { name: name.clone() },
+                    &self.metadata,
+                    self.use_fbcode_metadata,
+                ))
+                .await
+                .with_context(|| format!("WaitExecution failed for operation {name}"))?
+                .into_inner();
+        }
+    }
 }
 
 /// The cache half of `get_digests_ttl`, split out from the RPC so the caching
