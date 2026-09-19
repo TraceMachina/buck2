@@ -33,9 +33,30 @@ pub struct TClientContextMetadata {
     pub _dot_dot: (),
 }
 
+/// What the action is, for REAPI `RequestMetadata`.
+///
+/// REv2 defines `target_id`, `action_mnemonic` and `configuration_id`, and the
+/// OSS client has always sent them empty, so a server can attribute work to an
+/// invocation but not to a target or a rule. Buck2 knows all three by the time
+/// it talks to RE; they just had nowhere to travel.
+#[derive(Clone, Default)]
+pub struct ReRequestIdentity {
+    /// `cell//package:name` of the configured target the action belongs to.
+    pub target_id: String,
+    /// The action's category, e.g. `cxx_compile`. A bounded set, so it is safe
+    /// for a server to use as a metric label.
+    pub action_mnemonic: String,
+    /// Full name of the configuration the target is configured against.
+    pub configuration_id: String,
+    pub _dot_dot: (),
+}
+
 #[derive(Clone, Default)]
 pub struct RemoteExecutionMetadata {
     pub action_history_info: Option<ActionHistoryInfo>,
+    /// Absent for requests not tied to a single action, such as blob uploads
+    /// done ahead of execution or a capabilities call.
+    pub action_identity: Option<ReRequestIdentity>,
     pub buck_info: Option<BuckInfo>,
     pub platform: Option<TPlatform>,
     pub use_case_id: String,

@@ -1880,11 +1880,19 @@ fn with_re_metadata<T>(
             .insert_bin("re-metadata-bin", MetadataValue::from_bytes(&encoded));
     } else {
         let mut encoded = Vec::new();
+        let identity = metadata.action_identity.as_ref();
         RequestMetadata {
             tool_details: Some(ToolDetails {
                 tool_name: "buck2".to_owned(),
-                // TODO(#503): Pull the BuckVersion::get_unique_id() from BuckDaemon
-                tool_version: "0.1.0".to_owned(),
+                // Falls back to the old constant when the build carries no
+                // revision, e.g. a local cargo build, so the field is never
+                // empty for a server that keys off it.
+                tool_version: metadata
+                    .buck_info
+                    .as_ref()
+                    .map(|b| b.version.clone())
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "0.1.0".to_owned()),
             }),
             action_id: "".to_owned(),
             tool_invocation_id: metadata
@@ -1892,9 +1900,9 @@ fn with_re_metadata<T>(
                 .as_ref()
                 .map_or(String::new(), |buck_info| buck_info.build_id.clone()),
             correlated_invocations_id: "".to_owned(),
-            action_mnemonic: "".to_owned(),
-            target_id: "".to_owned(),
-            configuration_id: "".to_owned(),
+            action_mnemonic: identity.map_or(String::new(), |i| i.action_mnemonic.clone()),
+            target_id: identity.map_or(String::new(), |i| i.target_id.clone()),
+            configuration_id: identity.map_or(String::new(), |i| i.configuration_id.clone()),
         }
         .encode(&mut encoded)
         .expect("Encoding into a Vec cannot not fail");
@@ -3340,5 +3348,85 @@ mod action_result_ttl_tests {
         assert_eq!(converted.output_files.len(), 1);
         assert_eq!(converted.output_files[0].ttl, 604800);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod request_metadata_tests {
+    use prost::Message;
+
+    use super::*;
+
+    fn decode(req: &tonic::Request<()>) -> RequestMetadata {
+        let raw = req
+            .metadata()
+            .get_bin("build.bazel.remote.execution.v2.requestmetadata-bin")
+            .expect("request metadata header is absent")
+            .to_bytes()
+            .expect("request metadata header is not valid base64");
+        RequestMetadata::decode(raw).expect("request metadata does not decode")
+    }
+
+    /// Stock sent these three as empty strings, so a server could attribute
+    /// work to an invocation but never to a target or a rule.
+    #[test]
+    fn action_identity_reaches_the_wire() {
+        let metadata = RemoteExecutionMetadata {
+            action_identity: Some(ReRequestIdentity {
+                target_id: "root//src:hello".to_owned(),
+                action_mnemonic: "remote_gen".to_owned(),
+                configuration_id: "cfg:linux-x86_64#deadbeef".to_owned(),
+                ..Default::default()
+            }),
+            buck_info: Some(BuckInfo {
+                build_id: "trace-1".to_owned(),
+                version: "2026-09-18-abcdef".to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let decoded = decode(&with_re_metadata((), &metadata, false));
+        assert_eq!(decoded.target_id, "root//src:hello");
+        assert_eq!(decoded.action_mnemonic, "remote_gen");
+        assert_eq!(decoded.configuration_id, "cfg:linux-x86_64#deadbeef");
+        assert_eq!(decoded.tool_invocation_id, "trace-1");
+
+        let tool = decoded.tool_details.expect("tool details are absent");
+        assert_eq!(tool.tool_name, "buck2");
+        assert_eq!(
+            tool.tool_version, "2026-09-18-abcdef",
+            "the real revision should reach the wire, not the 0.1.0 placeholder",
+        );
+    }
+
+    /// Requests not tied to one action, such as a blob upload done ahead of
+    /// execution, carry no identity and must still be valid.
+    #[test]
+    fn absent_identity_leaves_the_fields_empty() {
+        let decoded = decode(&with_re_metadata(
+            (),
+            &RemoteExecutionMetadata::default(),
+            false,
+        ));
+        assert_eq!(decoded.target_id, "");
+        assert_eq!(decoded.action_mnemonic, "");
+        assert_eq!(decoded.configuration_id, "");
+    }
+
+    /// A build with no revision stamped in still has to send something a
+    /// server keying off tool_version can parse.
+    #[test]
+    fn tool_version_falls_back_when_no_revision_is_stamped() {
+        let metadata = RemoteExecutionMetadata {
+            buck_info: Some(BuckInfo {
+                build_id: "trace-1".to_owned(),
+                version: String::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let decoded = decode(&with_re_metadata((), &metadata, false));
+        assert_eq!(decoded.tool_details.unwrap().tool_version, "0.1.0");
     }
 }

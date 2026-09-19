@@ -12,6 +12,7 @@ use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_events::dispatch::get_dispatcher_opt;
 use remote_execution::ActionHistoryInfo;
 use remote_execution::BuckInfo;
+use remote_execution::ReRequestIdentity;
 use remote_execution::RemoteExecutionMetadata;
 
 use crate::re::action_identity::ReActionIdentity;
@@ -31,11 +32,21 @@ impl RemoteExecutionMetadataExt for RemoteExecutorUseCase {
             use_case_id: self.as_str().to_owned(),
             buck_info: Some(BuckInfo {
                 build_id: trace_id,
+                // Reaches the wire as REAPI ToolDetails.tool_version, which was
+                // hardcoded to "0.1.0". Empty when the version cannot be
+                // determined, which the client renders as the old constant.
+                version: buck2_build_info::revision().unwrap_or_default().to_owned(),
                 ..Default::default()
             }),
             action_history_info: identity.map(|identity| ActionHistoryInfo {
                 action_key: identity.action_key.clone(),
                 disable_retry_on_oom: false,
+                ..Default::default()
+            }),
+            action_identity: identity.map(|identity| ReRequestIdentity {
+                target_id: identity.target_id.clone(),
+                action_mnemonic: identity.action_mnemonic.clone(),
+                configuration_id: identity.configuration_id.clone(),
                 ..Default::default()
             }),
             disable_cancel_on_disconnect: true,

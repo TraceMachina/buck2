@@ -19,6 +19,14 @@ pub struct ReActionIdentity<'a> {
     /// client, so it's worth keeping around.
     _target: &'a dyn CommandExecutionTarget,
 
+    /// `cell//package:name` of the configured target this action belongs to,
+    /// its category, and its configuration. Carried as strings rather than
+    /// read back off `_target` on demand because the RE metadata is built well
+    /// away from here and does not hold the target's lifetime.
+    pub target_id: String,
+    pub action_mnemonic: String,
+    pub configuration_id: String,
+
     /// Actions with the same action key share e.g. memory requirements learnt by RE.
     pub action_key: String,
 
@@ -47,6 +55,9 @@ impl<'a> ReActionIdentity<'a> {
 
         Self {
             _target: target,
+            target_id: target.re_target_id(),
+            action_mnemonic: target.re_action_mnemonic(),
+            configuration_id: target.re_configuration_id(),
             action_key,
             affinity_key: target.re_affinity_key(),
             paths,
