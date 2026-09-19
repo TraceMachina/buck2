@@ -18,6 +18,17 @@ pub struct Buck2BuildInfo {
 
 pub static BUCK2_BUILD_INFO: LateBinding<Buck2BuildInfo> = LateBinding::new("BUCK2_BUILD_INFO");
 
+/// The non-upstream patches this build carries, appended to the version string.
+///
+/// A graft of a closed PR onto an upstream revision reports only the upstream
+/// revision, so `buck2 --version` from a patched binary is indistinguishable
+/// from a stock one and every support conversation has to start by
+/// reconstructing the build recipe. Naming the stack here means the binary
+/// answers that question itself.
+///
+/// Keep this in step with the branch: one token per carried patch.
+pub const PATCH_STACK: Option<&str> = Some("nativelink: buck2#1273+clamp");
+
 /// Get the source control revision for this binary, if available. We provide this externally when
 /// building Buck2 for release.
 pub fn revision() -> Option<&'static str> {

@@ -105,6 +105,14 @@ impl BuckVersion {
             format!("{internal_exe_hash} {internal_exe_hash_kind}")
         };
 
+        // A patched build must say so. The revision above names the upstream
+        // commit the patches were grafted onto, which on its own is
+        // indistinguishable from a stock binary at the same commit.
+        let version = match buck2_build_info::PATCH_STACK {
+            Some(patches) => format!("{version} ({patches})"),
+            None => version,
+        };
+
         Ok(BuckVersion {
             version,
             internal_exe_hash,

@@ -452,7 +452,7 @@ impl Interceptor for InjectHeadersInterceptor {
 
 type GrpcService = InterceptedService<PooledChannel, InjectHeadersInterceptor>;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum DigestRemoteState {
     ExistsOnRemote,
     Missing,
@@ -467,6 +467,21 @@ struct FindMissingCache {
 }
 
 impl FindMissingCache {
+    /// `cas_ttl_secs` is an upper bound on how long the server promises a
+    /// touched blob stays put, so the cache must not outlive it. It is also
+    /// clamped: following it upwards is a regression wherever it exceeds the
+    /// 12h this cache used unconditionally before. A deployment that sets it to
+    /// its server's retention (a week is normal) would otherwise cache
+    /// `ExistsOnRemote` for a week, and a blob evicted server-side inside that
+    /// window leaves the client wrong for the rest of it.
+    fn new(cas_ttl_secs: i64) -> Self {
+        Self {
+            cache: LruCache::new(NonZeroUsize::new(500_000).unwrap()),
+            ttl: Duration::from_secs(cas_ttl_secs.clamp(0, FIND_MISSING_CACHE_MAX_TTL_S) as u64),
+            last_check: Instant::now(),
+        }
+    }
+
     fn clear_if_ttl_expires(&mut self) {
         if self.last_check.elapsed() > self.ttl {
             self.cache.clear();
@@ -678,19 +693,7 @@ impl REClient {
             pool,
             capabilities,
             instance_name,
-            find_missing_cache: Mutex::new(FindMissingCache {
-                cache: LruCache::new(NonZeroUsize::new(500_000).unwrap()),
-                // Clamped, not just tied to cas_ttl_secs. Following it upwards
-                // is a regression wherever cas_ttl_secs exceeds the 12h this
-                // replaces: a deployment that sets it to its server's retention
-                // (a week is normal) would cache ExistsOnRemote for a week, and
-                // a blob evicted server-side inside that window leaves the
-                // client wrong for the rest of it. Only confirmed-present
-                // digests are cached now, which bounds the damage, but the
-                // cache should never outlive the shorter of the two bounds.
-                ttl: Duration::from_secs(cas_ttl_secs.clamp(0, FIND_MISSING_CACHE_MAX_TTL_S) as u64),
-                last_check: Instant::now(),
-            }),
+            find_missing_cache: Mutex::new(FindMissingCache::new(cas_ttl_secs)),
             bystream_compressor,
             max_decoding_msg_size,
             interceptor,
@@ -1006,34 +1009,13 @@ impl REClient {
         metadata: &RemoteExecutionMetadata,
         request: GetDigestsTtlRequest,
     ) -> anyhow::Result<GetDigestsTtlResponse> {
-        let mut remote_results: HashMap<TDigest, DigestRemoteState> = HashMap::new();
-        let mut digests_to_check: Vec<TDigest> = Vec::new();
-
-        let batch_size = self.runtime_opts.find_missing_blobs_batch_size;
-        let mut digest_iter = request.digests.iter();
-        while digest_iter.len() > 0 {
-            // Sort our blobs based on what action we need to take
-            {
-                let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
-                for digest in digest_iter.by_ref() {
-                    if let Some(rs) = find_missing_cache.get(digest) {
-                        // We have our final result already cached
-                        remote_results.insert(digest.clone(), rs);
-                    } else {
-                        // We can check this blob
-                        digests_to_check.push(digest.clone());
-                    }
-                    if digests_to_check.len() >= batch_size {
-                        break;
-                    }
-                }
-            }
-
-            // Send a request and notify others of the result
-            if !digests_to_check.is_empty() {
-                tracing::debug!(num_digests = digests_to_check.len(), "FindMissingBlobs");
-                let blob_digests: Vec<_> = digests_to_check.map(|b| tdigest_to(b.clone()));
-                let resp: FindMissingBlobsResponse = retry(|| async {
+        get_digests_ttl_impl(
+            &self.find_missing_cache,
+            &request.digests,
+            self.runtime_opts.find_missing_blobs_batch_size,
+            self.runtime_opts.cas_ttl_secs,
+            |blob_digests| async move {
+                retry(|| async {
                     let resp = self
                         .cas_client()
                         .await?
@@ -1050,50 +1032,10 @@ impl REClient {
                         .context("Failed to request what blobs are not present on remote")?;
                     Ok(resp.into_inner())
                 })
-                .await?;
-
-                // Build the set of missing digests first, so we don't
-                // prematurely cache them as ExistsOnRemote.
-                let missing: HashSet<TDigest> = resp
-                    .missing_blob_digests
-                    .iter()
-                    .map(|d| tdigest_from(d.clone()))
-                    .collect();
-
-                let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
-                for digest in &digests_to_check {
-                    if missing.contains(digest) {
-                        // Missing is a transient state: the blob may be uploaded
-                        // or produced by an RE action at any time.  Do NOT cache
-                        // it -- a stale "Missing" entry would prevent future
-                        // FindMissingBlobs RPCs, and a premature "ExistsOnRemote"
-                        // entry would cause concurrent actions to skip uploading
-                        // a blob that hasn't been uploaded yet.
-                        remote_results.insert(digest.clone(), DigestRemoteState::Missing);
-                    } else {
-                        remote_results.insert(digest.clone(), DigestRemoteState::ExistsOnRemote);
-                        find_missing_cache.put(digest.clone(), DigestRemoteState::ExistsOnRemote);
-                    }
-                }
-                digests_to_check.clear();
-            }
-        }
-
-        Ok(GetDigestsTtlResponse {
-            digests_with_ttl: remote_results
-                .iter()
-                .map(|(digest, rs)| match rs {
-                    DigestRemoteState::Missing => DigestWithTtl {
-                        digest: digest.clone(),
-                        ttl: 0,
-                    },
-                    DigestRemoteState::ExistsOnRemote => DigestWithTtl {
-                        digest: digest.clone(),
-                        ttl: self.runtime_opts.cas_ttl_secs,
-                    },
-                })
-                .collect::<Vec<DigestWithTtl>>(),
-        })
+                .await
+            },
+        )
+        .await
     }
 
     pub async fn extend_digest_ttl(
@@ -1347,6 +1289,93 @@ fn convert_t_action_result2(t_action_result: TActionResult2) -> anyhow::Result<A
     };
 
     Ok(action_result)
+}
+
+/// The cache half of `get_digests_ttl`, split out from the RPC so the caching
+/// rules can be tested without a server. Those rules are the substance of
+/// facebook/buck2#1273 bugs 2, 3 and 4, and they are easy to get subtly wrong:
+///
+///   * a digest the server reports missing is **not** cached, in either
+///     direction. `Missing` is transient, so caching it suppresses the next
+///     `FindMissingBlobs` for a blob that may have appeared in the meantime.
+///   * `ExistsOnRemote` is recorded only **after** the response says so. The
+///     original wrote it for every checked digest before reading the reply, so
+///     a concurrent action could see a hit for a blob that was still uploading
+///     and skip its own upload.
+async fn get_digests_ttl_impl<Fmb>(
+    find_missing_cache: &Mutex<FindMissingCache>,
+    digests: &[TDigest],
+    batch_size: usize,
+    cas_ttl_secs: i64,
+    find_missing: impl Fn(Vec<Digest>) -> Fmb,
+) -> anyhow::Result<GetDigestsTtlResponse>
+where
+    Fmb: Future<Output = anyhow::Result<FindMissingBlobsResponse>>,
+{
+    let mut remote_results: HashMap<TDigest, DigestRemoteState> = HashMap::new();
+    let mut digests_to_check: Vec<TDigest> = Vec::new();
+
+    let mut digest_iter = digests.iter();
+    while digest_iter.len() > 0 {
+        // Sort our blobs based on what action we need to take
+        {
+            let mut cache = find_missing_cache.lock().unwrap();
+            for digest in digest_iter.by_ref() {
+                if let Some(rs) = cache.get(digest) {
+                    // We have our final result already cached
+                    remote_results.insert(digest.clone(), rs);
+                } else {
+                    // We can check this blob
+                    digests_to_check.push(digest.clone());
+                }
+                if digests_to_check.len() >= batch_size {
+                    break;
+                }
+            }
+        }
+
+        // Send a request and notify others of the result
+        if !digests_to_check.is_empty() {
+            tracing::debug!(num_digests = digests_to_check.len(), "FindMissingBlobs");
+            let blob_digests: Vec<_> = digests_to_check.map(|b| tdigest_to(b.clone()));
+            let resp = find_missing(blob_digests).await?;
+
+            // Build the set of missing digests first, so we do not prematurely
+            // cache anything as ExistsOnRemote.
+            let missing: HashSet<TDigest> = resp
+                .missing_blob_digests
+                .iter()
+                .map(|d| tdigest_from(d.clone()))
+                .collect();
+
+            let mut cache = find_missing_cache.lock().unwrap();
+            for digest in &digests_to_check {
+                if missing.contains(digest) {
+                    remote_results.insert(digest.clone(), DigestRemoteState::Missing);
+                } else {
+                    remote_results.insert(digest.clone(), DigestRemoteState::ExistsOnRemote);
+                    cache.put(digest.clone(), DigestRemoteState::ExistsOnRemote);
+                }
+            }
+            digests_to_check.clear();
+        }
+    }
+
+    Ok(GetDigestsTtlResponse {
+        digests_with_ttl: remote_results
+            .iter()
+            .map(|(digest, rs)| match rs {
+                DigestRemoteState::Missing => DigestWithTtl {
+                    digest: digest.clone(),
+                    ttl: 0,
+                },
+                DigestRemoteState::ExistsOnRemote => DigestWithTtl {
+                    digest: digest.clone(),
+                    ttl: cas_ttl_secs,
+                },
+            })
+            .collect::<Vec<DigestWithTtl>>(),
+    })
 }
 
 async fn download_impl<Byt, BytRet, Cas>(
@@ -3078,4 +3107,238 @@ async fn test_download_compressed() -> anyhow::Result<()> {
     );
     assert_eq!(d_resp.inlined_blobs.unwrap()[0].blob, blob_data);
     Ok(())
+}
+
+// ── facebook/buck2#1273 regression tests ────────────────────────────────────
+//
+// Each of these fails on stock upstream. They are here because the failure
+// modes the patch fixes are concurrency- and timing-dependent and do not
+// reproduce reliably in an end-to-end build, so the caching rules have to be
+// pinned at this level instead.
+
+#[cfg(test)]
+mod find_missing_cache_tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+
+    fn digest(hash: &str) -> TDigest {
+        TDigest {
+            hash: hash.to_owned(),
+            size_in_bytes: 1,
+            ..Default::default()
+        }
+    }
+
+    fn ttl_of(resp: &GetDigestsTtlResponse, hash: &str) -> i64 {
+        resp.digests_with_ttl
+            .iter()
+            .find(|d| d.digest.hash == hash)
+            .unwrap_or_else(|| panic!("{hash} missing from the response"))
+            .ttl
+    }
+
+    /// Bug 4, and our clamp on top of it. The cache must not outlive the
+    /// server's promise, and must not outlive 12h even when that promise is
+    /// longer.
+    #[test]
+    fn cache_ttl_is_bounded_by_both_ends() {
+        assert_eq!(
+            FindMissingCache::new(3 * 60 * 60).ttl,
+            Duration::from_secs(3 * 60 * 60),
+            "below the ceiling the cache should follow cas_ttl_secs",
+        );
+        assert_eq!(
+            FindMissingCache::new(604800).ttl,
+            Duration::from_secs(FIND_MISSING_CACHE_MAX_TTL_S as u64),
+            "a week-long cas_ttl_secs must not become a week-long cache",
+        );
+        assert_eq!(
+            FindMissingCache::new(-1).ttl,
+            Duration::from_secs(0),
+            "a negative cas_ttl_secs must not wrap when cast to u64",
+        );
+    }
+
+    /// Bug 2. Stock recorded every checked digest as ExistsOnRemote before
+    /// reading the reply, so a digest the server said was missing was left
+    /// cached as present and the next caller skipped its upload.
+    #[tokio::test]
+    async fn a_missing_digest_is_not_cached_as_present() -> anyhow::Result<()> {
+        let cache = Mutex::new(FindMissingCache::new(3600));
+        let here = digest("aa");
+        let gone = digest("bb");
+
+        let resp = get_digests_ttl_impl(
+            &cache,
+            &[here.clone(), gone.clone()],
+            10,
+            3600,
+            |_| async {
+                Ok(FindMissingBlobsResponse {
+                    missing_blob_digests: vec![tdigest_to(digest("bb"))],
+                })
+            },
+        )
+        .await?;
+
+        assert_eq!(ttl_of(&resp, "aa"), 3600);
+        assert_eq!(ttl_of(&resp, "bb"), 0, "a missing blob has no ttl");
+
+        let mut cache = cache.lock().unwrap();
+        assert_eq!(cache.get(&here), Some(DigestRemoteState::ExistsOnRemote));
+        assert_eq!(
+            cache.get(&gone),
+            None,
+            "the missing digest must leave no cache entry at all",
+        );
+        Ok(())
+    }
+
+    /// Bug 3. `Missing` is transient: the blob may be uploaded, or produced by
+    /// an action, at any moment. Caching it suppressed the next
+    /// FindMissingBlobs and the client never noticed the blob had arrived.
+    #[tokio::test]
+    async fn a_missing_digest_is_rechecked_next_time() -> anyhow::Result<()> {
+        let cache = Mutex::new(FindMissingCache::new(3600));
+        let gone = digest("bb");
+        let calls = AtomicUsize::new(0);
+
+        // First pass: the server does not have it.
+        let resp = get_digests_ttl_impl(&cache, &[gone.clone()], 10, 3600, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                Ok(FindMissingBlobsResponse {
+                    missing_blob_digests: vec![tdigest_to(digest("bb"))],
+                })
+            }
+        })
+        .await?;
+        assert_eq!(ttl_of(&resp, "bb"), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Second pass: it has arrived. Stock never sent this RPC.
+        let resp = get_digests_ttl_impl(&cache, &[gone.clone()], 10, 3600, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                Ok(FindMissingBlobsResponse {
+                    missing_blob_digests: vec![],
+                })
+            }
+        })
+        .await?;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a previously-missing digest must be re-checked, not served from cache",
+        );
+        assert_eq!(ttl_of(&resp, "bb"), 3600);
+        Ok(())
+    }
+
+    /// A digest confirmed present is cached, so the second pass asks about
+    /// nothing at all. This is the behaviour the two tests above must not
+    /// regress while fixing the wrong-direction caching.
+    #[tokio::test]
+    async fn a_present_digest_is_served_from_cache() -> anyhow::Result<()> {
+        let cache = Mutex::new(FindMissingCache::new(3600));
+        let here = digest("aa");
+        let calls = AtomicUsize::new(0);
+
+        for _ in 0..2 {
+            let resp = get_digests_ttl_impl(&cache, &[here.clone()], 10, 3600, |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Ok(FindMissingBlobsResponse {
+                        missing_blob_digests: vec![],
+                    })
+                }
+            })
+            .await?;
+            assert_eq!(ttl_of(&resp, "aa"), 3600);
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the second pass should be answered from the cache",
+        );
+        Ok(())
+    }
+
+    /// Batching must not change any of the above. `batch_size` of 1 forces one
+    /// RPC per digest and mixes hits and misses across batches.
+    #[tokio::test]
+    async fn batching_preserves_the_caching_rules() -> anyhow::Result<()> {
+        let cache = Mutex::new(FindMissingCache::new(3600));
+        let calls = AtomicUsize::new(0);
+
+        let resp = get_digests_ttl_impl(
+            &cache,
+            &[digest("aa"), digest("bb"), digest("cc")],
+            1,
+            3600,
+            |reqs| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert_eq!(reqs.len(), 1, "batch_size of 1 must send one at a time");
+                    let missing = if reqs[0].hash == "bb" {
+                        vec![reqs[0].clone()]
+                    } else {
+                        vec![]
+                    };
+                    Ok(FindMissingBlobsResponse {
+                        missing_blob_digests: missing,
+                    })
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(ttl_of(&resp, "aa"), 3600);
+        assert_eq!(ttl_of(&resp, "bb"), 0);
+        assert_eq!(ttl_of(&resp, "cc"), 3600);
+
+        let mut cache = cache.lock().unwrap();
+        assert_eq!(cache.get(&digest("bb")), None);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod action_result_ttl_tests {
+    use re_grpc_proto::build::bazel::remote::execution::v2::ExecutedActionMetadata;
+    use re_grpc_proto::build::bazel::remote::execution::v2::OutputFile;
+
+    use super::*;
+
+    /// Bug 1. Stock hardcoded `ttl: 0` on every output file, so the deferred
+    /// materializer treated every freshly produced output as already expired
+    /// and went back to FindMissingBlobs instead of trusting it. `ttl` is a
+    /// buck2 extension with no REv2 equivalent, so the only honest value is
+    /// what the client was configured to expect.
+    #[test]
+    fn output_files_carry_the_configured_ttl() -> anyhow::Result<()> {
+        let result = ActionResult {
+            output_files: vec![OutputFile {
+                path: "out".to_owned(),
+                digest: Some(Digest {
+                    hash: "aa".to_owned(),
+                    size_bytes: 3,
+                }),
+                is_executable: false,
+                ..Default::default()
+            }],
+            execution_metadata: Some(ExecutedActionMetadata::default()),
+            ..Default::default()
+        };
+
+        let converted = convert_action_result(result, 604800)?;
+        assert_eq!(converted.output_files.len(), 1);
+        assert_eq!(converted.output_files[0].ttl, 604800);
+        Ok(())
+    }
 }
