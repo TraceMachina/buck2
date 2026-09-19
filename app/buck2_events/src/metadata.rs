@@ -221,7 +221,24 @@ pub fn username() -> buck2_error::Result<Option<String>> {
     }
     #[cfg(not(fbcode_build))]
     {
-        Ok::<Option<String>, buck2_error::Error>(None)
+        // Upstream returns None here because the internal `user` crate is
+        // compiled out, so every OSS build is attributed to nobody and any
+        // dashboard that groups by user shows one anonymous bucket. The
+        // environment is the portable answer: `USER` on unix, `USERNAME` on
+        // Windows. Both are advisory rather than authenticated, which is the
+        // same standing as the internal value for telemetry purposes.
+        //
+        // `[buck2_metadata]` buckconfig extras can also supply a username, but
+        // they cannot shadow this one: `collect_with_extras` only fills keys
+        // `collect` left empty. That ordering is deliberate, so populating this
+        // takes the field back from per-developer configuration.
+        Ok::<Option<String>, buck2_error::Error>(
+            env::var("USER")
+                .or_else(|_| env::var("USERNAME"))
+                .ok()
+                .map(|u| u.trim().to_owned())
+                .filter(|u| !u.is_empty()),
+        )
     }
 }
 
@@ -363,6 +380,47 @@ mod agent_id_tests {
         assert_eq!(
             agent_id("invocation_id=inv, id=claude_code"),
             Some("claude_code".to_owned()),
+        );
+    }
+}
+
+#[cfg(all(test, not(fbcode_build)))]
+mod oss_username_tests {
+    use super::*;
+
+    /// Upstream returns None here, so every OSS build is attributed to nobody
+    /// and a dashboard that groups by user shows one anonymous bucket. This is
+    /// the whole point of the patch, so assert the value is really there
+    /// rather than merely that the call succeeds.
+    #[test]
+    fn username_is_populated_in_an_oss_build() {
+        // The test runner inherits the developer's environment, and CI sets one
+        // of these too; skip rather than fail if a sandbox strips both.
+        let expected = match env::var("USER").or_else(|_| env::var("USERNAME")) {
+            Ok(u) if !u.trim().is_empty() => u.trim().to_owned(),
+            _ => return,
+        };
+
+        assert_eq!(username().unwrap(), Some(expected));
+    }
+
+    /// `collect` must actually carry it: the field is what the dashboard reads,
+    /// and `collect_with_extras` only fills keys `collect` left empty, so a
+    /// blank here would silently hand the field back to per-developer
+    /// buckconfig.
+    #[test]
+    fn collect_carries_the_username() {
+        if env::var("USER")
+            .or_else(|_| env::var("USERNAME"))
+            .map_or(true, |u| u.trim().is_empty())
+        {
+            return;
+        }
+
+        let map = collect(&DaemonId::new());
+        assert!(
+            map.get("username").is_some_and(|u| !u.is_empty()),
+            "collect() should report a username in an OSS build",
         );
     }
 }

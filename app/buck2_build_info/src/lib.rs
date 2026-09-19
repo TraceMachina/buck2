@@ -27,7 +27,7 @@ pub static BUCK2_BUILD_INFO: LateBinding<Buck2BuildInfo> = LateBinding::new("BUC
 /// answers that question itself.
 ///
 /// Keep this in step with the branch: one token per carried patch.
-pub const PATCH_STACK: Option<&str> = Some("nativelink: buck2#1273+clamp");
+pub const PATCH_STACK: Option<&str> = Some("nativelink: 1273+clamp,sink,reapi-meta,user");
 
 /// Get the source control revision for this binary, if available. We provide this externally when
 /// building Buck2 for release.
